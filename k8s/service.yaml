@@ -1,0 +1,56 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ SERVICE: СЕТЕВОЙ ДОСТУП К ПОДАМ                                             │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Service предоставляет стабильный endpoint для группы подов.
+# Поды создаются/удаляются, их IP меняются, но Service IP остаётся постоянным.
+#
+# ТИПЫ SERVICE:
+# - ClusterIP (default): доступен только внутри кластера
+# - NodePort: доступен снаружи через порт на каждой ноде
+# - LoadBalancer: создаёт внешний load balancer (AWS ELB, GCP LB)
+#
+# ПРИМЕНЕНИЕ:
+#   kubectl apply -f k8s/service.yaml -n real-time-system
+#
+# ПРОВЕРКА:
+#   kubectl get svc -n real-time-system
+#   kubectl describe svc app-service -n real-time-system
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-service
+  namespace: real-time-system
+  labels:
+    app: real-time-system
+spec:
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ TYPE: ClusterIP                                                         │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Доступен только внутри кластера.
+  # Для внешнего доступа используй Ingress или LoadBalancer.
+  type: ClusterIP
+
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ SELECTOR                                                                │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Какие поды получают трафик от этого Service.
+  # Должен совпадать с labels в Deployment.spec.template.metadata.labels
+  selector:
+    app: real-time-system
+    component: api
+
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ PORTS                                                                   │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # port: порт Service (на который приходят запросы)
+  # targetPort: порт контейнера (куда перенаправляются запросы)
+  #
+  # Внутри кластера: http://app-service.real-time-system:80
+  # Или короче:      http://app-service:80 (в том же namespace)
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP

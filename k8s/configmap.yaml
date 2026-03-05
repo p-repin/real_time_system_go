@@ -1,0 +1,34 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ CONFIGMAP: НЕ-СЕКРЕТНАЯ КОНФИГУРАЦИЯ                                        │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# ConfigMap хранит конфигурацию, которая НЕ является секретом.
+# Для паролей, токенов, ключей используй Secret.
+#
+# ПРИМЕНЕНИЕ:
+#   kubectl apply -f k8s/configmap.yaml -n real-time-system
+#
+# ПРОСМОТР:
+#   kubectl get configmap app-config -n real-time-system -o yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: real-time-system
+  labels:
+    app: real-time-system
+data:
+  # PostgreSQL (без пароля!)
+  POSTGRES_HOST: "postgres-service"
+  POSTGRES_PORT: "5432"
+  POSTGRES_NAME: "real_time_system"
+  POSTGRES_USERNAME: "postgres"
+  POSTGRES_CONNECT_TIMEOUT: "10s"
+
+  # HTTP Server
+  HTTP_PORT: "8080"
+  HTTP_READ_TIMEOUT: "15s"
+  HTTP_WRITE_TIMEOUT: "15s"
+  HTTP_IDLE_TIMEOUT: "60s"
+  HTTP_SHUTDOWN_TIMEOUT: "30s"

@@ -1,0 +1,59 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ DOCKERIGNORE                                                                │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Файлы, которые НЕ копируются в Docker build context.
+#
+# ЗАЧЕМ:
+# 1. Безопасность: .env с секретами не попадёт в образ
+# 2. Скорость: меньше файлов → быстрее COPY
+# 3. Кэш: изменение .git не инвалидирует кэш слоёв
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Environment (СЕКРЕТЫ!)
+.env
+.env.*
+*.env
+
+# Build artifacts
+/bin
+/build
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+coverage.out
+coverage.html
+
+# Documentation (генерируется в CI)
+# docs/  # оставляем, нужны для swagger
+
+# Temporary
+tmp/
+*.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kubernetes manifests (не нужны в образе)
+k8s/
+*.yaml
+!docker-compose.yaml
+
+# Migrations (опционально, зависит от стратегии)
+# migrations/  # если миграции применяются отдельно

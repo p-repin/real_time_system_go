@@ -1,0 +1,76 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ INGRESS: ВНЕШНИЙ HTTP ДОСТУП                                                │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Ingress — это HTTP(S) роутер для внешнего трафика.
+# Позволяет:
+# - Роутинг по path: /api → service-a, /web → service-b
+# - Роутинг по host: api.example.com → service-a
+# - TLS termination (HTTPS)
+# - Rate limiting, auth (зависит от Ingress Controller)
+#
+# ТРЕБУЕТ INGRESS CONTROLLER:
+# - nginx-ingress (популярный)
+# - traefik
+# - AWS ALB Ingress Controller
+# - GKE Ingress
+#
+# УСТАНОВКА nginx-ingress (minikube):
+#   minikube addons enable ingress
+#
+# УСТАНОВКА nginx-ingress (helm):
+#   helm install nginx-ingress ingress-nginx/ingress-nginx
+#
+# ПРИМЕНЕНИЕ:
+#   kubectl apply -f k8s/ingress.yaml -n real-time-system
+#
+# ПРОВЕРКА:
+#   kubectl get ingress -n real-time-system
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  namespace: real-time-system
+  labels:
+    app: real-time-system
+  annotations:
+    # nginx-ingress specific annotations
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # Rate limiting (опционально)
+    # nginx.ingress.kubernetes.io/limit-rps: "10"
+spec:
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ INGRESS CLASS                                                           │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Указывает, какой Ingress Controller обрабатывает этот Ingress.
+  # "nginx" — стандартное имя для nginx-ingress.
+  ingressClassName: nginx
+
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ RULES                                                                   │
+  # └────────────────────────────────────────────────────────────────────────┘
+  rules:
+    # Для локальной разработки используй localhost или добавь в /etc/hosts:
+    # 127.0.0.1 api.local
+    - host: api.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app-service
+                port:
+                  number: 80
+
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ TLS (опционально)                                                       │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Для HTTPS нужен Secret с сертификатом.
+  # В production используй cert-manager для автоматического Let's Encrypt.
+  #
+  # tls:
+  #   - hosts:
+  #       - api.example.com
+  #     secretName: api-tls-secret

@@ -1,0 +1,6 @@
+.env
+.mcp.json
+.idea/
+*.exe
+.CLAUDE.md
+.claude/

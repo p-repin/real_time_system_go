@@ -1,0 +1,164 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ DEPLOYMENT: УПРАВЛЕНИЕ ПОДАМИ                                               │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Deployment управляет ReplicaSet, который управляет Pods.
+# Обеспечивает:
+# - Desired state (replicas: 2 → всегда 2 пода)
+# - Rolling updates (обновление без downtime)
+# - Rollback (откат к предыдущей версии)
+#
+# ПРИМЕНЕНИЕ:
+#   kubectl apply -f k8s/deployment.yaml -n real-time-system
+#
+# ПРОСМОТР:
+#   kubectl get pods -n real-time-system
+#   kubectl describe deployment app -n real-time-system
+#
+# ЛОГИ:
+#   kubectl logs -f deployment/app -n real-time-system
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: real-time-system
+  labels:
+    app: real-time-system
+spec:
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ REPLICAS                                                                 │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Количество одновременно работающих подов.
+  # 2 = high availability (если один упадёт, второй обработает трафик)
+  replicas: 2
+
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ SELECTOR                                                                 │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Какие поды управляются этим Deployment.
+  # Должен совпадать с template.metadata.labels
+  selector:
+    matchLabels:
+      app: real-time-system
+      component: api
+
+  # ┌────────────────────────────────────────────────────────────────────────┐
+  # │ ROLLING UPDATE STRATEGY                                                  │
+  # └────────────────────────────────────────────────────────────────────────┘
+  # Как обновлять поды при изменении image/config.
+  #
+  # maxUnavailable: 0 = ни один под не может быть недоступен во время обновления
+  # maxSurge: 1 = можно создать 1 дополнительный под (всего 3 во время обновления)
+  #
+  # Процесс: создаём новый под → ждём ready → удаляем старый → повторяем
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: real-time-system
+        component: api
+    spec:
+      # ┌──────────────────────────────────────────────────────────────────────┐
+      # │ CONTAINERS                                                            │
+      # └──────────────────────────────────────────────────────────────────────┘
+      containers:
+        - name: app
+          # ⚠️  Замени на свой image registry
+          image: real-time-system:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # ┌────────────────────────────────────────────────────────────────────┐
+          # │ ENVIRONMENT VARIABLES                                              │
+          # └────────────────────────────────────────────────────────────────────┘
+          # Конфигурация из ConfigMap и Secret
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+
+          # ┌────────────────────────────────────────────────────────────────────┐
+          # │ RESOURCE LIMITS                                                    │
+          # └────────────────────────────────────────────────────────────────────┘
+          # ПОЧЕМУ ВАЖНО:
+          # - Без limits под может съесть все ресурсы ноды → другие поды упадут
+          # - requests используется для scheduling (на какую ноду поставить)
+          # - limits — жёсткий потолок (превышение → OOMKill)
+          #
+          # ПРАВИЛО: requests = типичное потребление, limits = пиковое + 20%
+          resources:
+            requests:
+              cpu: "100m"      # 0.1 CPU core
+              memory: "128Mi"  # 128 MB RAM
+            limits:
+              cpu: "500m"      # 0.5 CPU core
+              memory: "256Mi"  # 256 MB RAM
+
+          # ┌────────────────────────────────────────────────────────────────────┐
+          # │ LIVENESS PROBE                                                     │
+          # └────────────────────────────────────────────────────────────────────┘
+          # "Жив ли контейнер?"
+          #
+          # Если liveness probe падает → Kubernetes убивает под и создаёт новый.
+          # Используется для обнаружения deadlock, infinite loop, зависания.
+          #
+          # initialDelaySeconds: 10 = ждём 10 сек после старта (приложение грузится)
+          # periodSeconds: 15 = проверяем каждые 15 сек
+          # failureThreshold: 3 = 3 неудачи подряд → restart
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # ┌────────────────────────────────────────────────────────────────────┐
+          # │ READINESS PROBE                                                    │
+          # └────────────────────────────────────────────────────────────────────┘
+          # "Готов ли контейнер принимать трафик?"
+          #
+          # Если readiness probe падает → под убирается из Service (не получает трафик).
+          # НЕ убивает под, просто перестаёт направлять запросы.
+          #
+          # Используется для:
+          # - Ожидания подключения к БД
+          # - Загрузки кэша
+          # - Прогрева (warmup)
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # ┌────────────────────────────────────────────────────────────────────┐
+          # │ SECURITY CONTEXT                                                   │
+          # └────────────────────────────────────────────────────────────────────┘
+          # Запуск от non-root пользователя (как в Dockerfile)
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+
+      # ┌────────────────────────────────────────────────────────────────────────┐
+      # │ TERMINATION GRACE PERIOD                                               │
+      # └────────────────────────────────────────────────────────────────────────┘
+      # Время на graceful shutdown перед SIGKILL.
+      # Должно быть >= HTTP_SHUTDOWN_TIMEOUT (30s)
+      terminationGracePeriodSeconds: 45

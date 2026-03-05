@@ -1,0 +1,19 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ NAMESPACE                                                                   │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Namespace изолирует ресурсы приложения от других приложений в кластере.
+#
+# ПРИМЕНЕНИЕ:
+#   kubectl apply -f k8s/namespace.yaml
+#
+# ПЕРЕКЛЮЧЕНИЕ КОНТЕКСТА:
+#   kubectl config set-context --current --namespace=real-time-system
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: real-time-system
+  labels:
+    app: real-time-system
+    environment: development
