@@ -1,0 +1,61 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ GRAFANA DATASOURCES — АВТОПРОВИЖИНИНГ                                      │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Grafana поддерживает провижининг через файлы конфигурации.
+# Это позволяет не настраивать datasources вручную при каждом запуске.
+#
+# Файлы из /etc/grafana/provisioning/datasources/ применяются при старте.
+# После применения datasources видны в Grafana UI → Configuration → Data sources.
+
+apiVersion: 1
+
+datasources:
+  # ── Prometheus ─────────────────────────────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    access: proxy    # Grafana-сервер проксирует запросы (не браузер)
+    url: http://prometheus:9090
+    isDefault: true  # Datasource по умолчанию для новых панелей
+    editable: true
+    jsonData:
+      # Интервал по умолчанию для запросов (совпадает со scrape_interval)
+      timeInterval: "15s"
+      # Включить exemplars — связь метрик с трейсами (Prometheus → Jaeger)
+      # При нажатии на точку на графике — откроется трейс в Jaeger!
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger_uid  # Ссылка на Jaeger datasource
+
+  # ── Jaeger ─────────────────────────────────────────────────────────────
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger_uid  # Используется в exemplarTraceIdDestinations выше
+    access: proxy
+    url: http://jaeger:16686
+    editable: true
+
+  # ── Loki ───────────────────────────────────────────────────────────────
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      # Derived fields: извлекаем trace_id из лога и создаём ссылку на Jaeger.
+      #
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │ КОРРЕЛЯЦИЯ ЛОГОВ С ТРЕЙСАМИ                                        │
+      # └──────────────────────────────────────────────────────────────────┘
+      #
+      # Когда в логе есть поле trace_id (из OTel propagation),
+      # Grafana автоматически создаёт ссылку "View trace in Jaeger".
+      #
+      # Это замыкает круг observability:
+      # Метрика (высокая latency) → Лог (ошибка с trace_id) → Трейс (где именно)
+      derivedFields:
+        - matcherRegex: '"trace_id":"([a-f0-9]+)"'
+          name: TraceID
+          url: "$${__value.raw}"
+          datasourceUid: jaeger_uid
+          urlDisplayLabel: "View trace in Jaeger"

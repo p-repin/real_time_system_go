@@ -1,0 +1,63 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ LOKI CONFIGURATION                                                         │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Loki — система хранения логов от Grafana Labs.
+# Принцип: "like Prometheus, but for logs".
+#
+# КЛЮЧЕВОЕ ОТЛИЧИЕ ОТ ELASTICSEARCH:
+# - Loki НЕ индексирует содержимое логов
+# - Индексирует только labels (metadata)
+# - Содержимое логов хранится сжатым (как chunks)
+#
+# Это даёт:
+# - Значительно меньше RAM и CPU
+# - Дешевле хранение (S3/filesystem vs Lucene indexes)
+# - Минус: полнотекстовый поиск медленнее (scan chunks)
+#
+# Наша схема labels:
+# {service="real-time-system", container="rts_app"} → поток логов приложения
+
+auth_enabled: false  # Без аутентификации (локальная разработка)
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn  # Меньше шума от самого Loki
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/loki
+  storage:
+    filesystem:
+      chunks_directory: /tmp/loki/chunks
+      rules_directory: /tmp/loki/rules
+  replication_factor: 1  # Single-node (локальная разработка)
+  ring:
+    kvstore:
+      store: inmemory
+
+# Схема индексации
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb        # Time Series Database — эффективнее старого boltdb
+      object_store: filesystem
+      schema: v13        # Последняя версия схемы
+      index:
+        prefix: index_
+        period: 24h      # Индексные файлы разбиты по дням
+
+# Ограничения ingestion (важно для production)
+limits_config:
+  # Максимальный размер одного лог-entry (защита от гигантских stack trace)
+  max_line_size: 256KB
+  # Reject логи старше 1 часа (Promtail не должен слать старые логи)
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h  # 7 дней
+  # Retention — как долго хранить логи
+  retention_period: 168h  # 7 дней (для локальной разработки)
+
+# Ruler (опционально): можно настроить alerting по логам
+ruler:
+  alertmanager_url: http://localhost:9093

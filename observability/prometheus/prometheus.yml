@@ -1,0 +1,44 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ PROMETHEUS CONFIGURATION                                                   │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Prometheus работает по принципу PULL: он сам ходит к таргетам и забирает метрики.
+# Это отличает его от push-систем (StatsD, InfluxDB).
+#
+# Преимущества pull:
+# - Prometheus контролирует частоту scrape (не таргет)
+# - Если таргет недоступен — Prometheus знает об этом
+# - Нет проблемы "карточный домик" (сервис не может "наспамить" метриками)
+# - Легко дебажить: можно вручную открыть /metrics в браузере
+
+global:
+  # Как часто Prometheus собирает метрики.
+  # 15s — стандарт для большинства приложений.
+  # Для быстроменяющихся метрик (latency) можно уменьшить до 5s.
+  scrape_interval: 15s
+
+  # Как часто пересчитываются recording rules и alerts.
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── Наше приложение ──────────────────────────────────────────────────────
+  #
+  # job_name — логическое имя группы таргетов.
+  # Это значение попадёт в label "job" всех метрик из этого job.
+  # В Grafana: {job="real-time-system"} для фильтрации.
+  - job_name: "real-time-system"
+    static_configs:
+      - targets:
+          # app:8080 — hostname контейнера в Docker-сети + порт приложения
+          # Prometheus ходит на http://app:8080/metrics
+          - "app:8080"
+    # Путь для scrape (default: /metrics)
+    metrics_path: /metrics
+
+  # ── Сам Prometheus (self-monitoring) ─────────────────────────────────────
+  #
+  # Prometheus экспортирует метрики о себе: scrape duration, targets up/down.
+  # Полезно для мониторинга мониторинга :)
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

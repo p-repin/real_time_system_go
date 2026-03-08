@@ -1,0 +1,19 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ GRAFANA DASHBOARD PROVISIONING                                             │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Grafana автоматически загружает dashboard'ы из указанной директории.
+# Файлы JSON из /var/lib/grafana/dashboards/ будут импортированы при старте.
+
+apiVersion: 1
+
+providers:
+  - name: "Real Time System"
+    orgId: 1
+    folder: "Real Time System"
+    type: file
+    disableDeletion: false  # Можно удалять через UI
+    updateIntervalSeconds: 30  # Проверять обновления файлов каждые 30s
+    allowUiUpdates: true  # Разрешить редактировать в UI (изменения не сохраняются в файл)
+    options:
+      path: /var/lib/grafana/dashboards

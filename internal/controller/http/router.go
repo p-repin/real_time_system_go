@@ -6,8 +6,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	httpSwagger "github.com/swaggo/http-swagger"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"real_time_system/internal/controller/http/middleware"
+	"real_time_system/internal/observability"
 	"real_time_system/internal/service"
 
 	// ВАЖНО: импорт docs для регистрации swagger спецификации
@@ -35,14 +37,61 @@ type Router struct {
 }
 
 // NewRouter создаёт и настраивает HTTP-роутер.
-func NewRouter(userService *service.UserService, cartService *service.CartService, orderService *service.OrderService) *Router {
+//
+// m — Prometheus метрики, передаются снаружи (создаются в server.go).
+// Это dependency injection: router не создаёт метрики сам, получает их извне.
+func NewRouter(
+	userService *service.UserService,
+	cartService *service.CartService,
+	orderService *service.OrderService,
+	m *observability.Metrics,
+) *Router {
 	r := chi.NewRouter()
 
 	// ── Global Middleware ──────────────────────────────────────────────────
+	//
+	// ПОРЯДОК MIDDLEWARE ИМЕЕТ ЗНАЧЕНИЕ:
+	//
+	// 1. RequestID   — генерируем/читаем X-Request-ID (нужен логгеру и трейсингу)
+	// 2. Recoverer   — ловим panic ПЕРЕД логированием (иначе 500 не залогируется)
+	// 3. OTel HTTP   — создаём trace span для всего запроса (span охватывает весь pipeline)
+	// 4. Metrics     — Prometheus счётчики (после OTel, чтобы видеть трейс в метриках)
+	// 5. Logging     — логируем запрос последним (видим финальный статус после всех MW)
 
 	r.Use(middleware.RequestID)
 	r.Use(chimiddleware.Recoverer)
+
+	// ── OpenTelemetry HTTP Middleware ──────────────────────────────────────
+	//
+	// otelhttp.NewMiddleware создаёт span для каждого HTTP-запроса:
+	//   span name: "GET /api/v1/orders/{id}"
+	//   span attributes: http.method, http.url, http.status_code, http.target
+	//
+	// Span автоматически связывается с входящим traceparent заголовком
+	// (если запрос пришёл от другого сервиса).
+	//
+	// WithRouteTag — добавляет chi route pattern в span как атрибут.
+	// Без него span name = URL с реальным UUID → высокая кардинальность.
+	r.Use(func(next http.Handler) http.Handler {
+		// otelhttp.NewMiddleware оборачивает весь handler, включая роутинг.
+		// operation name "http.request" будет уточнён chi route pattern'ом.
+		return otelhttp.NewMiddleware("http.request")(next)
+	})
+
+	// ── Prometheus Metrics Middleware ──────────────────────────────────────
+	r.Use(m.Middleware)
+
 	r.Use(middleware.Logging)
+
+	// ── Prometheus Metrics Endpoint ────────────────────────────────────────
+	//
+	// GET /metrics — Prometheus scrape endpoint.
+	//
+	// ПОЧЕМУ НЕ ВЫНОСИТЬ НА ОТДЕЛЬНЫЙ ПОРТ?
+	// В production /metrics часто доступен только внутри кластера (не в Ingress).
+	// Для нашего случая (локальная разработка) один порт удобнее.
+	// В kubernetes можно закрыть через NetworkPolicy.
+	r.Get("/metrics", observability.Handler().ServeHTTP)
 
 	// ── Health Check ───────────────────────────────────────────────────────
 

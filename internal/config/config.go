@@ -11,6 +11,7 @@ type Config struct {
 	PostgresConfig
 	HTTPConfig
 	KafkaConfig
+	ObservabilityConfig
 }
 
 // LoadConfig загружает конфигурацию из .env файла и переменных окружения.

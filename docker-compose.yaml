@@ -118,7 +118,156 @@ services:
       - rts_network
 
   # ════════════════════════════════════════════════════════════════════════
-  # Application
+  # Prometheus — сбор метрик
+  # ════════════════════════════════════════════════════════════════════════
+  #
+  # Prometheus работает по принципу PULL: сам ходит к таргетам за метриками.
+  # Конфиг prometheus.yml описывает: кого опрашивать и как часто.
+  #
+  # UI доступен по адресу: http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: rts_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      # Монтируем конфиг
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Персистентное хранение данных метрик
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Retention: хранить метрики 15 дней (для локальной разработки достаточно)
+      - "--storage.tsdb.retention.time=15d"
+      # Web UI для удобства
+      - "--web.enable-lifecycle"  # Позволяет hot-reload конфига через API
+    networks:
+      - rts_network
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Jaeger — распределённый трейсинг
+  # ════════════════════════════════════════════════════════════════════════
+  #
+  # jaeger-all-in-one = collector + query + UI в одном контейнере.
+  # Для production используется jaeger-operator в Kubernetes
+  # или отдельные компоненты с Cassandra/Elasticsearch backend.
+  #
+  # ПОРТЫ:
+  # 4317 — OTLP gRPC (наш Go-код отправляет трейсы сюда)
+  # 4318 — OTLP HTTP (альтернатива gRPC)
+  # 16686 — Jaeger UI (http://localhost:16686)
+  #
+  # UI доступен по адресу: http://localhost:16686
+  jaeger:
+    image: jaegertracing/all-in-one:1.69
+    container_name: rts_jaeger
+    ports:
+      - "4317:4317"   # OTLP gRPC — наш Go-код отправляет трейсы
+      - "4318:4318"   # OTLP HTTP
+      - "16686:16686" # Jaeger UI
+    environment:
+      # Хранилище трейсов.
+      # memory — всё в RAM (теряется при рестарте), подходит для разработки.
+      # В production: badger (embedded) или elasticsearch.
+      SPAN_STORAGE_TYPE: memory
+      # Максимальное количество трейсов в памяти (защита от OOM)
+      MEMORY_MAX_TRACES: "50000"
+    networks:
+      - rts_network
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Loki — хранение логов
+  # ════════════════════════════════════════════════════════════════════════
+  #
+  # Loki принимает логи от Promtail и хранит их.
+  # Grafana обращается к Loki для отображения логов.
+  #
+  # В отличие от Elasticsearch, Loki индексирует только labels (metadata),
+  # а не содержимое логов. Это дешевле по ресурсам.
+  #
+  # Порт 3100 — HTTP API (принимает логи, отвечает на запросы Grafana)
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: rts_loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/tmp/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - rts_network
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Promtail — агент сбора логов
+  # ════════════════════════════════════════════════════════════════════════
+  #
+  # Promtail читает логи контейнеров через Docker socket и отправляет в Loki.
+  #
+  # ПОЧЕМУ DOCKER SOCKET?
+  # При запуске в контейнере Promtail не видит логи других контейнеров.
+  # Монтируем /var/run/docker.sock → Promtail получает доступ к Docker API
+  # → находит все контейнеры → читает их stdout/stderr.
+  #
+  # БЕЗОПАСНОСТЬ: docker.sock = root-доступ к хосту.
+  # В production используют Kubernetes DaemonSet с ограниченными правами
+  # вместо монтирования docker.sock.
+  promtail:
+    image: grafana/promtail:3.5.0
+    container_name: rts_promtail
+    volumes:
+      - ./observability/promtail/promtail.yml:/etc/promtail/config.yml:ro
+      # Docker socket — для service discovery и чтения логов контейнеров
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - rts_network
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Grafana — визуализация
+  # ════════════════════════════════════════════════════════════════════════
+  #
+  # Grafana — единый интерфейс для метрик (Prometheus), трейсов (Jaeger)
+  # и логов (Loki). Все три datasource настроены через провижининг.
+  #
+  # ПРОВИЖИНИНГ:
+  # Вместо ручной настройки через UI, конфиги подключаются как файлы.
+  # При рестарте настройки сохраняются — не нужно настраивать заново.
+  #
+  # Логин: admin / admin
+  # UI доступен по адресу: http://localhost:3000
+  grafana:
+    image: grafana/grafana:12.0.0
+    container_name: rts_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Отключаем аналитику (не нужна для локальной разработки)
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      # Провижининг datasources (Prometheus, Jaeger, Loki)
+      - ./observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      # Провижининг dashboard-провайдера (путь к JSON-файлам)
+      - ./observability/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      # Сами JSON-файлы dashboard'ов
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Персистентное хранение (настройки пользователей, аннотации)
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+    networks:
+      - rts_network
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Application (обновлено: добавлены переменные observability)
   # ════════════════════════════════════════════════════════════════════════
   app:
     build:
@@ -141,10 +290,14 @@ services:
       HTTP_WRITE_TIMEOUT: 15s
       HTTP_IDLE_TIMEOUT: 60s
       HTTP_SHUTDOWN_TIMEOUT: 30s
-      # Kafka connection
-      # Внутри Docker-сети используем PLAINTEXT listener (kafka:9092)
+      # Kafka connection (внутри Docker-сети — PLAINTEXT listener)
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_TOPIC_ORDERS: "orders"
+      # Observability
+      # Jaeger OTLP gRPC — внутри Docker-сети: jaeger:4317
+      JAEGER_ENDPOINT: "jaeger:4317"
+      SERVICE_NAME: "real-time-system"
+      TRACING_ENABLED: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -161,6 +314,9 @@ services:
 volumes:
   postgres_data:
   kafka_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
 
 networks:
   rts_network:

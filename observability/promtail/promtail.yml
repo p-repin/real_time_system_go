@@ -1,0 +1,109 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ PROMTAIL CONFIGURATION                                                     │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Promtail — агент для сбора логов и отправки в Loki.
+# Аналог: Filebeat для Elasticsearch, Fluentd для любых систем.
+#
+# ЧТО ДЕЛАЕТ PROMTAIL:
+# 1. Читает файлы логов / stdout контейнеров
+# 2. Парсит и обогащает labels (job, container, level)
+# 3. Буферизирует и отправляет в Loki
+#
+# НАША СХЕМА:
+# Promtail монтирует /var/lib/docker/containers (Docker log files).
+# Каждый контейнер пишет stdout в JSON-файл:
+#   /var/lib/docker/containers/<id>/<id>-json.log
+#
+# Строка лога = JSON с полями:
+#   {"log": "...", "stream": "stdout", "time": "..."}
+#
+# Promtail извлекает metadata контейнера из docker labels.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  # Файл для хранения позиции чтения (чтобы после рестарта не читать сначала)
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # ── Чтение логов Docker-контейнеров ──────────────────────────────────────
+  - job_name: docker-containers
+    docker_sd_configs:
+      # Подключаемся к Docker socket для service discovery
+      # Promtail сам находит все запущенные контейнеры
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+
+    relabel_configs:
+      # ── Фильтрация: только наш контейнер ─────────────────────────────────
+      #
+      # Docker метаданные доступны как labels с префиксом __meta_docker_*
+      # Нам нужен только контейнер rts_app (имя из docker-compose)
+      - source_labels: [__meta_docker_container_name]
+        regex: "/rts_app"
+        action: keep  # Отбрасываем всё, что не совпадает
+
+      # ── Нормализация имени контейнера ─────────────────────────────────────
+      #
+      # Docker называет контейнеры "/rts_app" (с ведущим слешем).
+      # Убираем слеш для чистого label: container="rts_app"
+      - source_labels: [__meta_docker_container_name]
+        target_label: container
+        regex: "/(.*)"
+        replacement: "$1"
+
+      # ── Label: service ────────────────────────────────────────────────────
+      # Добавляем label service для фильтрации в Grafana
+      - target_label: service
+        replacement: "real-time-system"
+
+      # ── Label: job ────────────────────────────────────────────────────────
+      - target_label: job
+        replacement: "docker-logs"
+
+    # ── Обработка лога после сбора ────────────────────────────────────────
+    pipeline_stages:
+      # Docker логирует в JSON-формате:
+      # {"log":"<actual log message>\n","stream":"stdout","time":"..."}
+      # Нам нужно достать поле "log" как тело записи.
+      - json:
+          expressions:
+            output: log          # поле "log" → output
+            stream: stream       # "stdout" или "stderr"
+
+      # Устанавливаем распарсенный лог как тело записи
+      - output:
+          source: output
+
+      # Добавляем label stream (stdout/stderr) для фильтрации
+      - labels:
+          stream:
+
+      # ── Парсинг JSON-логов нашего приложения ─────────────────────────────
+      #
+      # Наш Zap-логгер пишет структурированный JSON:
+      # {"level":"info","ts":1234567890,"msg":"http request completed","method":"GET",...}
+      #
+      # Извлекаем поле "level" чтобы можно было фильтровать по уровню лога.
+      - json:
+          expressions:
+            level: level    # "debug", "info", "warn", "error"
+          source: output
+
+      # Добавляем level как label — основной label для фильтрации
+      - labels:
+          level:
+
+      # ── Timestamp из лога (не из Docker) ─────────────────────────────────
+      #
+      # Используем timestamp из JSON-лога (ts), а не время получения Promtail.
+      # Это важно для корректной сортировки в Grafana при задержках.
+      - timestamp:
+          source: ts
+          format: Unix  # Zap пишет Unix timestamp по умолчанию

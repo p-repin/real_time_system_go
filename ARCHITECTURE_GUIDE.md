@@ -28,6 +28,12 @@
 19. [Атомарное обновление stock](#атомарное-обновление-stock)
 20. [Action-based API: Production подход](#action-based-api-production-подход)
 21. [PlaceOrder: Транзакция оформления заказа](#placeorder-транзакция-оформления-заказа)
+22. [Observability: Три Столпа Наблюдаемости](#observability-три-столпа-наблюдаемости)
+23. [Prometheus: Метрики и RED Method](#prometheus-метрики-и-red-method)
+24. [OpenTelemetry: Трейсинг с Jaeger](#opentelemetry-трейсинг-с-jaeger)
+25. [Loki: Логи и корреляция с трейсами](#loki-логи-и-корреляция-с-трейсами)
+26. [Grafana: Дашборды и расследование инцидентов](#grafana-дашборды-и-расследование-инцидентов)
+27. [Практика: Как найти проблему по шагам](#практика-как-найти-проблему-по-шагам)
 
 ---
 
@@ -3025,6 +3031,14 @@ if order.UserID != userID {
 - Добавлен раздел "Ownership Check: Безопасность"
 - Проверка order.UserID == userID
 - NotFound вместо Forbidden (не раскрываем существование чужих ресурсов)
+
+**Changelog 3.0:**
+- Добавлены разделы 22–27: Observability (Prometheus, OTel/Jaeger, Loki, Grafana)
+- RED Method, Histogram vs Summary, HIGH CARDINALITY проблема
+- OpenTelemetry: TracerProvider, BatchSpanProcessor, OTLP gRPC, Shutdown
+- Span'ы в PlaceOrder: как читать трейс в Jaeger
+- Корреляция трёх сигналов: метрики → логи → трейс
+- Полный workflow расследования инцидента по шагам
 
 **Changelog 2.5:**
 - Добавлен раздел "Querier Interface: Поддержка транзакций"

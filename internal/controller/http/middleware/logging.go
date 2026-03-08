@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"real_time_system/internal/logger"
 )
 
@@ -81,35 +83,44 @@ func Logging(next http.Handler) http.Handler {
 		duration := time.Since(start)
 		l := logger.FromContext(r.Context())
 
+		// ── Корреляция логов с трейсами ────────────────────────────────────
+		//
+		// Добавляем trace_id в каждый лог-запись.
+		// Это позволяет перейти из лога в Jaeger одним кликом в Grafana:
+		//   Loki: {service="real-time-system"} → находим запись с ошибкой
+		//   Нажимаем на trace_id → открывается трейс в Jaeger
+		//
+		// trace_id доступен, потому что otelhttp middleware (в router.go)
+		// выполняется ДО logging middleware и создаёт span в контексте.
+		//
+		// Если трейсинг выключен (TracingEnabled=false) — trace_id будет пустой
+		// строкой, но лог не сломается.
+		spanCtx := trace.SpanContextFromContext(r.Context())
+		fields := []interface{}{
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.status,
+			"duration_ms", duration.Milliseconds(),
+			"request_id", GetRequestID(r.Context()),
+		}
+		if spanCtx.IsValid() {
+			fields = append(fields,
+				"trace_id", spanCtx.TraceID().String(),
+				"span_id", spanCtx.SpanID().String(),
+			)
+		}
+
 		// Определяем уровень лога по статус-коду
 		//   2xx, 3xx → Info
 		//   4xx → Warn (клиентская ошибка, не наша проблема)
 		//   5xx → Error (серверная ошибка, нужно разбираться)
 		switch {
 		case wrapped.status >= 500:
-			l.Errorw("http request failed",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", wrapped.status,
-				"duration_ms", duration.Milliseconds(),
-				"request_id", GetRequestID(r.Context()),
-			)
+			l.Errorw("http request failed", fields...)
 		case wrapped.status >= 400:
-			l.Warnw("http request client error",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", wrapped.status,
-				"duration_ms", duration.Milliseconds(),
-				"request_id", GetRequestID(r.Context()),
-			)
+			l.Warnw("http request client error", fields...)
 		default:
-			l.Infow("http request completed",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", wrapped.status,
-				"duration_ms", duration.Milliseconds(),
-				"request_id", GetRequestID(r.Context()),
-			)
+			l.Infow("http request completed", fields...)
 		}
 	})
 }

@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"real_time_system/internal/config"
 	httpctrl "real_time_system/internal/controller/http"
 	"real_time_system/internal/events"
 	"real_time_system/internal/logger"
+	"real_time_system/internal/observability"
 	"real_time_system/internal/repository/postgres"
 	"real_time_system/internal/service"
 	"real_time_system/pkg/client"
@@ -27,8 +29,8 @@ import (
 // все зависимости приложения:
 //
 //	Config → Postgres+Kafka → Repository → Service → Handler → Router → HTTP Server
-//	                                                                    ↑
-//	                                                         + Consumer goroutine
+//	                       → TracerProvider (OTel → Jaeger)
+//	                       → Metrics (Prometheus)
 //
 // ПОЧЕМУ ЗДЕСЬ, А НЕ В MAIN:
 // - main() должен быть тривиальным: создать → запустить → обработать ошибку
@@ -37,8 +39,9 @@ import (
 type Server struct {
 	cfg            *config.Config
 	pg             *client.Postgres
-	kafkaProducer  *kafka.Producer         // нужен для Close() при shutdown
+	kafkaProducer  *kafka.Producer            // нужен для Close() при shutdown
 	orderConsumer  *events.OrderEventConsumer // нужен для Close() при shutdown
+	tracerProvider *observability.TracerProvider // нужен для Shutdown() — flush span'ов
 	httpServer     *http.Server
 }
 
@@ -116,8 +119,43 @@ func New(ctx context.Context) (*Server, error) {
 		orderEventPublisher, // передаём publisher через DI
 	)
 
+	// ── Observability ──────────────────────────────────────────────────────
+
+	// Prometheus метрики: создаём один экземпляр на всё приложение.
+	// promauto регистрирует метрики в DefaultRegisterer при создании NewMetrics().
+	metrics := observability.NewMetrics()
+
+	// OpenTelemetry TracerProvider → Jaeger.
+	//
+	// ┌──────────────────────────────────────────────────────────────────────┐
+	// │ ПОЧЕМУ ТРЕЙСИНГ ИНИЦИАЛИЗИРУЕТСЯ ЗДЕСЬ?                                │
+	// └──────────────────────────────────────────────────────────────────────┘
+	//
+	// InitTracing устанавливает глобальный TracerProvider через otel.SetTracerProvider().
+	// Это должно произойти ДО создания любых middleware или handlers,
+	// которые вызывают otel.Tracer("...").
+	//
+	// Если TRACING_ENABLED=false — TracerProvider не создаётся,
+	// otel использует NoopTracerProvider (нет overhead, нет трейсов).
+	var tracerProvider *observability.TracerProvider
+	if cfg.ObservabilityConfig.TracingEnabled {
+		tracerProvider, err = observability.InitTracing(
+			ctx,
+			cfg.ObservabilityConfig.ServiceName,
+			cfg.ObservabilityConfig.JaegerEndpoint,
+		)
+		if err != nil {
+			// Не фатально: приложение работает без трейсинга.
+			// В production можно сделать фатальным (return nil, err).
+			logger.FromContext(ctx).Warnw("failed to init tracing, running without it",
+				"error", err,
+				"jaeger_endpoint", cfg.ObservabilityConfig.JaegerEndpoint,
+			)
+		}
+	}
+
 	// 6. Create HTTP router with handlers
-	router := httpctrl.NewRouter(userService, cartService, orderService)
+	router := httpctrl.NewRouter(userService, cartService, orderService, metrics)
 
 	// 6. Create HTTP server
 	//
@@ -142,11 +180,12 @@ func New(ctx context.Context) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:           cfg,
-		pg:            pg,
-		kafkaProducer: kafkaProducer,
-		orderConsumer: orderConsumer,
-		httpServer:    httpServer,
+		cfg:            cfg,
+		pg:             pg,
+		kafkaProducer:  kafkaProducer,
+		orderConsumer:  orderConsumer,
+		tracerProvider: tracerProvider,
+		httpServer:     httpServer,
 	}, nil
 }
 
@@ -246,14 +285,23 @@ func (s *Server) Run() error {
 //
 // ПОРЯДОК ЗАКРЫТИЯ ВАЖЕН:
 // 1. HTTP-сервер уже остановлен (Shutdown вызван в Run)
-// 2. Kafka Producer — flush буферизированных сообщений, закрыть соединения
-// 3. PostgreSQL — закрыть пул соединений последним
+// 2. TracerProvider — flush незаконченных span'ов в Jaeger
+// 3. Kafka Producer — flush буферизированных сообщений
+// 4. PostgreSQL — закрыть пул соединений последним
 //
-// Почему Kafka перед PostgreSQL?
-// После остановки HTTP-сервера новых запросов нет, но Publisher мог
-// поставить сообщения в буфер (если Writer асинхронный).
-// Close() flush'ит буфер → все сообщения доставлены до закрытия.
+// Почему TracerProvider первым?
+// После HTTP Shutdown новых span'ов нет, но BatchSpanProcessor может иметь
+// span'ы в буфере. TracerProvider.Shutdown() флашит их в Jaeger.
+// Если закрыть раньше — потеряем трейсы последних запросов.
 func (s *Server) shutdown() {
+	// Закрываем TracerProvider: flush всех буферизированных span'ов.
+	// БЕЗ ЭТОГО: последние ~5 секунд трейсов будут потеряны.
+	if s.tracerProvider != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.tracerProvider.Shutdown(shutdownCtx)
+	}
+
 	// Закрываем Kafka Consumer: дожидаемся завершения текущего сообщения.
 	// Consumer.Run() уже завершился (ctx отменён), Close() освобождает соединение.
 	if s.orderConsumer != nil {
@@ -263,8 +311,6 @@ func (s *Server) shutdown() {
 	// Закрываем Kafka Producer: flush буферизированных сообщений
 	if s.kafkaProducer != nil {
 		if err := s.kafkaProducer.Close(); err != nil {
-			// Логировать ошибку нет возможности (logger может быть недоступен),
-			// поэтому просто закрываем. В production — добавить логирование.
 			_ = err
 		}
 	}

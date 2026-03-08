@@ -2,11 +2,17 @@ package service
 
 import (
 	"context"
+
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"real_time_system/domain"
 	"real_time_system/domain/entity"
 	"real_time_system/domain/repository"
 	"real_time_system/internal/events"
+	"real_time_system/internal/observability"
 	"real_time_system/internal/repository/postgres"
 	"real_time_system/internal/service/dto"
 )
@@ -359,9 +365,58 @@ func (s *OrderService) CancelOrder(ctx context.Context, userID entity.UserID, or
 	return &response, nil
 }
 
+// PlaceOrder создаёт заказ из корзины пользователя в рамках ACID-транзакции.
+//
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ТРЕЙСИНГ: ПОЧЕМУ ИМЕННО PlaceOrder?                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+//
+// PlaceOrder — самый критичный путь в системе:
+//   1. Читает корзину (SELECT)
+//   2. Загружает продукты batch (SELECT IN)
+//   3. Создаёт заказ (INSERT)
+//   4. Уменьшает stock для каждого товара (UPDATE × N)
+//   5. Очищает корзину (DELETE)
+//   6. Коммитит транзакцию
+//   7. Публикует событие в Kafka
+//
+// Если PlaceOrder медленный — клиент ждёт. Метрики покажут latency,
+// но не скажут ПОЧЕМУ. Трейс покажет, какой именно шаг замедлился.
+//
+// Пример реального сценария:
+//   span "PlaceOrder" = 800ms
+//   ├── span "TX: FindByUserID" = 5ms   (индекс есть, быстро)
+//   ├── span "TX: FindByIDs"    = 10ms  (batch, эффективно)
+//   ├── span "TX: Create order" = 15ms
+//   ├── span "TX: DecrementStock × 5" = 750ms  ← БУТЫЛОЧНОЕ ГОРЛЫШКО!
+//   └── span "TX: Commit"       = 5ms
+//
+// Вывод: нет индекса на products.id при UPDATE DecrementStock.
+// Без трейсинга пришлось бы гадать или добавлять отдельные метрики.
 func (s *OrderService) PlaceOrder(ctx context.Context, userID entity.UserID) (*dto.OrderResponse, error) {
+	// ── Создаём корневой span для всей операции ────────────────────────────
+	//
+	// observability.Tracer("real_time_system/service") — именованный трейсер.
+	// Имя трейсера отображается в Jaeger как "instrumentation library".
+	//
+	// tracer.Start() возвращает новый контекст с активным span'ом.
+	// Все дочерние span'ы (в подфункциях) будут автоматически прикреплены
+	// к этому span'у через ctx.
+	tracer := observability.Tracer("real_time_system/service")
+	ctx, span := tracer.Start(ctx, "OrderService.PlaceOrder")
+	defer span.End() // span закрывается при выходе из функции
+
+	// Добавляем атрибуты span'а: они отображаются в Jaeger как теги.
+	// userID поможет найти трейс при расследовании конкретного инцидента.
+	span.SetAttributes(
+		attribute.String("user.id", userID.String()),
+	)
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		// recordError — хелпер: устанавливает статус span'а в Error + добавляет событие.
+		// Без этого span будет завершён без статуса → в Jaeger не видно что была ошибка.
+		recordError(span, err)
 		return nil, domain.NewInternalError("dont have transactions", err)
 	}
 	defer tx.Rollback(ctx)
@@ -373,17 +428,23 @@ func (s *OrderService) PlaceOrder(ctx context.Context, userID entity.UserID) (*d
 
 	cart, err := cartRepo.FindByUserID(ctx, userID)
 	if err != nil {
+		recordError(span, err)
 		return nil, domain.NewNotFoundError("cart")
 	}
 
 	cart, err = cartRepo.GetCartWithItems(ctx, cart.ID)
 	if err != nil {
+		recordError(span, err)
 		return nil, domain.NewNotFoundError("cart")
 	}
 
 	if len(cart.Items) == 0 {
 		return nil, domain.NewValidationError("cart is empty")
 	}
+
+	// Добавляем количество товаров как атрибут: поможет коррелировать
+	// latency с размером заказа (больше товаров → больше DecrementStock)
+	span.SetAttributes(attribute.Int("order.items_count", len(cart.Items)))
 
 	productIDs := make([]entity.ProductID, 0, len(cart.Items))
 	for _, item := range cart.Items {
@@ -392,6 +453,7 @@ func (s *OrderService) PlaceOrder(ctx context.Context, userID entity.UserID) (*d
 
 	products, err := productRepo.FindByIDs(ctx, productIDs)
 	if err != nil {
+		recordError(span, err)
 		return nil, domain.NewInternalError("dont get products", err)
 	}
 
@@ -422,26 +484,51 @@ func (s *OrderService) PlaceOrder(ctx context.Context, userID entity.UserID) (*d
 
 	order, err := entity.NewOrder(userID, orderItems)
 	if err != nil {
+		recordError(span, err)
 		return nil, err
 	}
 
 	if err := orderRepo.Create(ctx, order); err != nil {
+		recordError(span, err)
 		return nil, err
 	}
 
+	// Дочерний span для цикла DecrementStock.
+	//
+	// ┌──────────────────────────────────────────────────────────────────────┐
+	// │ ПОЧЕМУ SPAN ДЛЯ ЦИКЛА, А НЕ ДЛЯ КАЖДОГО ВЫЗОВА?                      │
+	// └──────────────────────────────────────────────────────────────────────┘
+	//
+	// Каждый вызов DecrementStock — отдельная SQL операция.
+	// При 100 товарах в заказе → 100 span'ов → шум в Jaeger.
+	//
+	// Решение: один span для всего цикла + атрибут "items.count".
+	// Если цикл медленный — уже видно в родительском span'е.
+	// Если нужна детализация по конкретному товару — добавить span внутрь.
+	_, decrementSpan := tracer.Start(ctx, "TX.DecrementStock")
+	decrementSpan.SetAttributes(attribute.Int("items.count", len(orderItems)))
 	for _, item := range orderItems {
 		if err := productRepo.DecrementStock(ctx, item.ProductID, item.Quantity); err != nil {
+			decrementSpan.End()
+			recordError(span, err)
 			return nil, err
 		}
 	}
+	decrementSpan.End()
 
 	if err := cartItemRepo.Clear(ctx, cart.ID); err != nil {
+		recordError(span, err)
 		return nil, domain.NewInternalError("failed to clear cart", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		recordError(span, err)
 		return nil, domain.NewInternalError("failed to commit", err)
 	}
+
+	// После успешного коммита — добавляем ID созданного заказа в span.
+	// Теперь в Jaeger можно найти трейс по order.id.
+	span.SetAttributes(attribute.String("order.id", order.ID.String()))
 
 	// ┌──────────────────────────────────────────────────────────────────────┐
 	// │ ПУБЛИКАЦИЯ СОБЫТИЯ ПОСЛЕ COMMIT ТРАНЗАКЦИИ                             │
@@ -472,5 +559,18 @@ func (s *OrderService) PlaceOrder(ctx context.Context, userID entity.UserID) (*d
 
 	response := dto.ToOrderResponse(order)
 	return &response, nil
+}
 
+// recordError помечает span как ошибочный и записывает детали.
+//
+// span.RecordError(err) — добавляет событие "exception" в span с stack trace.
+// span.SetStatus(codes.Error, ...) — устанавливает статус span'а.
+//
+// ПОЧЕМУ НУЖНО И ТО, И ДРУГОЕ?
+//   RecordError — добавляет событие (видно в timeline span'а)
+//   SetStatus   — устанавливает итоговый статус (влияет на цвет в Jaeger UI)
+//   Без SetStatus span будет зелёным даже при ошибке!
+func recordError(span trace.Span, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
 }
