@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"real_time_system/internal/analytics"
 	"real_time_system/internal/config"
 	httpctrl "real_time_system/internal/controller/http"
 	"real_time_system/internal/events"
@@ -37,12 +38,14 @@ import (
 // - Server можно тестировать с mock-зависимостями
 // - При добавлении новых компонентов main не разрастается
 type Server struct {
-	cfg            *config.Config
-	pg             *client.Postgres
-	kafkaProducer  *kafka.Producer            // нужен для Close() при shutdown
-	orderConsumer  *events.OrderEventConsumer // нужен для Close() при shutdown
-	tracerProvider *observability.TracerProvider // нужен для Shutdown() — flush span'ов
-	httpServer     *http.Server
+	cfg               *config.Config
+	pg                *client.Postgres
+	ch                *client.ClickHouse          // ClickHouse для аналитики (может быть nil)
+	kafkaProducer     *kafka.Producer             // нужен для Close() при shutdown
+	orderConsumer     *events.OrderEventConsumer  // нужен для Close() при shutdown
+	analyticsConsumer *analytics.Consumer         // Kafka → ClickHouse (может быть nil)
+	tracerProvider    *observability.TracerProvider // нужен для Shutdown() — flush span'ов
+	httpServer        *http.Server
 }
 
 // New создаёт Server, инициализируя все зависимости.
@@ -55,6 +58,8 @@ type Server struct {
 // 5. Handlers → Router — создаём HTTP слой
 // 6. HTTP Server — готов к запуску
 func New(ctx context.Context) (*Server, error) {
+	l := logger.FromContext(ctx)
+
 	// 1. Load config
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -119,6 +124,68 @@ func New(ctx context.Context) (*Server, error) {
 		orderEventPublisher, // передаём publisher через DI
 	)
 
+	// ── ClickHouse для аналитики ──────────────────────────────────────────
+	//
+	// ┌──────────────────────────────────────────────────────────────────────┐
+	// │ ПОЧЕМУ ИНИЦИАЛИЗАЦИЯ CLICKHOUSE — НЕ ФАТАЛЬНАЯ?                       │
+	// └──────────────────────────────────────────────────────────────────────┘
+	//
+	// ClickHouse — вспомогательная система (аналитика), не основная (заказы).
+	// Если ClickHouse недоступен:
+	//   - Заказы продолжают работать (PostgreSQL + Kafka)
+	//   - Уведомления продолжают работать (OrderEventConsumer)
+	//   - Только аналитические дашборды перестают обновляться
+	//
+	// Это degraded mode: система работает, но без аналитики.
+	// Аналогия: сломался Grafana → мониторинг не работает,
+	// но пользователи не замечают (сервис отвечает).
+	//
+	// В production: алерт "ClickHouse disconnected" через Prometheus metric.
+	var ch *client.ClickHouse
+	var analyticsConsumer *analytics.Consumer
+
+	ch, err = client.NewClickHouse(ctx, cfg)
+	if err != nil {
+		l.Warnw("failed to connect to ClickHouse, analytics disabled",
+			"error", err,
+		)
+	}
+
+	if ch != nil {
+		// InitSchema: CREATE DATABASE + CREATE TABLE IF NOT EXISTS.
+		// Идемпотентно: безопасно вызывать при каждом старте.
+		if err := ch.InitSchema(ctx); err != nil {
+			l.Warnw("failed to init ClickHouse schema, analytics disabled",
+				"error", err,
+			)
+			_ = ch.Close()
+			ch = nil
+		}
+	}
+
+	if ch != nil {
+		// Создаём analytics consumer с ОТДЕЛЬНОЙ consumer group.
+		//
+		// "order-analytics" — уникальный GroupID.
+		// Kafka доставляет каждое событие в КАЖДУЮ группу:
+		//   "order-notifications" получит order.placed → отправит email
+		//   "order-analytics"     получит order.placed → запишет в ClickHouse
+		//
+		// Если analytics consumer отстал или упал → notifications не замедляются.
+		analyticsKafkaConsumer := kafka.NewConsumer(
+			cfg.KafkaConfig.Brokers,
+			cfg.KafkaConfig.TopicOrders,
+			"order-analytics",
+		)
+		analyticsRepo := analytics.NewRepository(ch, cfg.ClickHouseDatabase)
+		analyticsConsumer = analytics.NewConsumer(
+			analyticsKafkaConsumer,
+			analyticsRepo,
+			cfg.ClickHouseBatchSize,
+			cfg.ClickHouseFlushInterval,
+		)
+	}
+
 	// ── Observability ──────────────────────────────────────────────────────
 
 	// Prometheus метрики: создаём один экземпляр на всё приложение.
@@ -180,12 +247,14 @@ func New(ctx context.Context) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:            cfg,
-		pg:             pg,
-		kafkaProducer:  kafkaProducer,
-		orderConsumer:  orderConsumer,
-		tracerProvider: tracerProvider,
-		httpServer:     httpServer,
+		cfg:               cfg,
+		pg:                pg,
+		ch:                ch,
+		kafkaProducer:     kafkaProducer,
+		orderConsumer:     orderConsumer,
+		analyticsConsumer: analyticsConsumer,
+		tracerProvider:    tracerProvider,
+		httpServer:        httpServer,
 	}, nil
 }
 
@@ -228,6 +297,13 @@ func (s *Server) Run() error {
 	// - Consumer.ReadMessage(ctx) возвращает ошибку ctx.Err()
 	// - Consumer.Run() возвращает управление (горутина завершается)
 	go s.orderConsumer.Run(ctx)
+
+	// Запускаем Analytics Consumer (Kafka → ClickHouse).
+	// Аналогично orderConsumer, но с буферизацией (batch insert).
+	// При ctx.Done() consumer выполнит finalFlush → запишет оставшийся буфер.
+	if s.analyticsConsumer != nil {
+		go s.analyticsConsumer.Run(ctx)
+	}
 
 	// Запускаем HTTP-сервер в отдельной горутине
 	go func() {
@@ -283,40 +359,52 @@ func (s *Server) Run() error {
 
 // shutdown выполняет корректное освобождение ресурсов.
 //
-// ПОРЯДОК ЗАКРЫТИЯ ВАЖЕН:
-// 1. HTTP-сервер уже остановлен (Shutdown вызван в Run)
-// 2. TracerProvider — flush незаконченных span'ов в Jaeger
-// 3. Kafka Producer — flush буферизированных сообщений
-// 4. PostgreSQL — закрыть пул соединений последним
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ПОРЯДОК ЗАКРЫТИЯ: ОТ ВЫСОКОУРОВНЕВЫХ К НИЗКОУРОВНЕВЫМ                    │
+// └──────────────────────────────────────────────────────────────────────────┘
 //
-// Почему TracerProvider первым?
-// После HTTP Shutdown новых span'ов нет, но BatchSpanProcessor может иметь
-// span'ы в буфере. TracerProvider.Shutdown() флашит их в Jaeger.
-// Если закрыть раньше — потеряем трейсы последних запросов.
+// 1. HTTP-сервер (уже остановлен в Run → новых запросов нет)
+// 2. TracerProvider — flush span'ов в Jaeger
+// 3. Order Consumer — Kafka (notifications)
+// 4. Analytics Consumer — Kafka → flush буфера в ClickHouse
+// 5. Kafka Producer — flush буферизированных сообщений
+// 6. ClickHouse — закрыть ПОСЛЕ analytics consumer (consumer делает flush → write в CH)
+// 7. PostgreSQL — закрыть ПОСЛЕДНИМ (после всех сервисов)
+//
+// Критический момент: Analytics Consumer ПЕРЕД ClickHouse!
+// Consumer.Close() → finalFlush() → InsertOrderEvents() → нужен живой ClickHouse.Conn.
+// Если закрыть ClickHouse раньше → finalFlush получит "connection closed" →
+// данные из буфера потеряны.
 func (s *Server) shutdown() {
-	// Закрываем TracerProvider: flush всех буферизированных span'ов.
-	// БЕЗ ЭТОГО: последние ~5 секунд трейсов будут потеряны.
+	// 2. TracerProvider: flush всех буферизированных span'ов.
 	if s.tracerProvider != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.tracerProvider.Shutdown(shutdownCtx)
 	}
 
-	// Закрываем Kafka Consumer: дожидаемся завершения текущего сообщения.
-	// Consumer.Run() уже завершился (ctx отменён), Close() освобождает соединение.
+	// 3. Order Consumer (Kafka notifications).
 	if s.orderConsumer != nil {
 		_ = s.orderConsumer.Close()
 	}
 
-	// Закрываем Kafka Producer: flush буферизированных сообщений
-	if s.kafkaProducer != nil {
-		if err := s.kafkaProducer.Close(); err != nil {
-			_ = err
-		}
+	// 4. Analytics Consumer: flush буфера в ClickHouse → закрыть Kafka reader.
+	// Run() уже вызвал finalFlush (при ctx.Done()), Close() закрывает Kafka reader.
+	if s.analyticsConsumer != nil {
+		_ = s.analyticsConsumer.Close()
 	}
 
-	// Закрываем пул соединений с БД ПОСЛЕДНИМ
-	// (после того как HTTP-сервер остановлен и нет активных запросов)
+	// 5. Kafka Producer: flush буферизированных сообщений.
+	if s.kafkaProducer != nil {
+		_ = s.kafkaProducer.Close()
+	}
+
+	// 6. ClickHouse: закрыть ПОСЛЕ analytics consumer.
+	if s.ch != nil {
+		_ = s.ch.Close()
+	}
+
+	// 7. PostgreSQL: закрыть ПОСЛЕДНИМ.
 	if s.pg != nil {
 		s.pg.Close()
 	}
