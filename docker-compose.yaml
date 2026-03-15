@@ -95,6 +95,64 @@ services:
       - rts_network
 
   # ════════════════════════════════════════════════════════════════════════
+  # ClickHouse — колоночная СУБД для аналитики
+  # ════════════════════════════════════════════════════════════════════════
+  #
+  # ┌──────────────────────────────────────────────────────────────────────┐
+  # │ ПОЧЕМУ CLICKHOUSE, А НЕ POSTGRESQL ДЛЯ АНАЛИТИКИ?                     │
+  # └──────────────────────────────────────────────────────────────────────┘
+  #
+  # PostgreSQL (OLTP, row-based):
+  #   Хранит строки целиком: [id, type, date, user_id, amount, currency, ...]
+  #   SELECT avg(amount) FROM orders → читает ВСЕ колонки каждой строки
+  #   100M строк × 10 колонок × 50 байт = ~50 ГБ для чтения → 30 секунд
+  #
+  # ClickHouse (OLAP, column-based):
+  #   Хранит каждую колонку отдельно: [amount, amount, amount, ...]
+  #   SELECT avg(amount) → читает ТОЛЬКО колонку amount
+  #   100M строк × 1 колонка × 8 байт = ~800 МБ → 0.1 секунда
+  #   Бонус: одинаковые данные в колонке сжимаются лучше (10-20x compression)
+  #
+  # ПОРТЫ:
+  #   8123 — HTTP интерфейс (для браузера, curl, Grafana)
+  #          Встроенный Play UI: http://localhost:8123/play
+  #   9000 — Native TCP (для Go-клиента, batch insert)
+  #
+  # Play UI доступен по адресу: http://localhost:8123/play
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: rts_clickhouse
+    ports:
+      # HTTP: для Grafana datasource и ad-hoc запросов через Play UI
+      - "8123:8123"
+      # Native TCP: для Go-клиента (batch insert, быстрее HTTP)
+      - "9000:9000"
+    environment:
+      # Создать БД "analytics" при первом запуске.
+      # DDL таблиц выполняется из Go-кода (InitSchema).
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      # Разрешить управление доступом через SQL (CREATE USER, GRANT).
+      # В production: создать read-only пользователя для Grafana.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      # ClickHouse использует много файловых дескрипторов (один на каждый part/колонку).
+      # Default 1024 может быть недостаточно при большом количестве таблиц/partitions.
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rts_network
+
+  # ════════════════════════════════════════════════════════════════════════
   # PostgreSQL
   # ════════════════════════════════════════════════════════════════════════
   postgres:
@@ -250,6 +308,9 @@ services:
       # Отключаем аналитику (не нужна для локальной разработки)
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Установить ClickHouse datasource плагин при старте.
+      # Без этого: Grafana не знает тип "grafana-clickhouse-datasource" → ошибка провижининга.
+      GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource"
     volumes:
       # Провижининг datasources (Prometheus, Jaeger, Loki)
       - ./observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
@@ -298,10 +359,16 @@ services:
       JAEGER_ENDPOINT: "jaeger:4317"
       SERVICE_NAME: "real-time-system"
       TRACING_ENABLED: "true"
+      # ClickHouse — внутри Docker-сети: clickhouse:9000
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_DATABASE: "analytics"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
@@ -314,6 +381,7 @@ services:
 volumes:
   postgres_data:
   kafka_data:
+  clickhouse_data:
   prometheus_data:
   loki_data:
   grafana_data:

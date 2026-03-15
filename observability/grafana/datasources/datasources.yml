@@ -59,3 +59,39 @@ datasources:
           url: "$${__value.raw}"
           datasourceUid: jaeger_uid
           urlDisplayLabel: "View trace in Jaeger"
+
+  # ── ClickHouse ─────────────────────────────────────────────────────────
+  #
+  # ┌──────────────────────────────────────────────────────────────────────┐
+  # │ GRAFANA + CLICKHOUSE: АНАЛИТИЧЕСКИЕ ДАШБОРДЫ                          │
+  # └──────────────────────────────────────────────────────────────────────┘
+  #
+  # Grafana поддерживает ClickHouse как datasource через плагин
+  # grafana-clickhouse-datasource (встроенный в Grafana 10+).
+  #
+  # Это позволяет строить аналитические дашборды напрямую из ClickHouse:
+  #   - Воронка заказов (placed → paid → delivered)
+  #   - GMV (Gross Merchandise Value) по дням
+  #   - Топ-10 товаров по продажам
+  #   - Средний чек, количество отмен
+  #
+  # ПОЧЕМУ НЕ ЧЕРЕЗ PROMETHEUS?
+  #   Prometheus хранит метрики 15 дней (retention).
+  #   ClickHouse хранит события 12 месяцев (TTL в таблице).
+  #   Для долгосрочной аналитики (тренды за полгода) нужен ClickHouse.
+  #   Prometheus — для operational dashboards (latency, errors за последний час).
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    url: http://clickhouse:8123
+    editable: true
+    jsonData:
+      # Порт HTTP-интерфейса ClickHouse (не Native TCP 9000!)
+      # Grafana общается с ClickHouse через HTTP (стандарт для datasources).
+      port: 8123
+      host: clickhouse
+      protocol: http
+      defaultDatabase: analytics
+      username: default
+    secureJsonData:
+      password: ""

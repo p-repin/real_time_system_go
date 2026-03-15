@@ -12,6 +12,7 @@ type Config struct {
 	HTTPConfig
 	KafkaConfig
 	ObservabilityConfig
+	ClickHouseConfig
 }
 
 // LoadConfig загружает конфигурацию из .env файла и переменных окружения.

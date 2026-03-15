@@ -1,0 +1,164 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "E-Commerce аналитика: воронка заказов, GMV, топ товаров (ClickHouse)",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Заказы по статусам (воронка)",
+      "description": "Количество событий каждого типа. Показывает воронку: placed → paid → shipped → delivered и % отмен.",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_type, count(DISTINCT event_id) as cnt FROM analytics.order_events WHERE event_date >= today() - 30 GROUP BY event_type ORDER BY cnt DESC",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      }
+    },
+    {
+      "title": "GMV по дням (Gross Merchandise Value)",
+      "description": "Общая сумма заказов (order.placed) по дням в рублях. GMV = сумма всех оформленных заказов.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_date as time, sum(total_amount) / 100 as gmv_rub FROM analytics.order_events WHERE event_type = 'order.placed' AND event_date >= today() - 30 GROUP BY event_date ORDER BY event_date",
+          "format": 0
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyRUB",
+          "custom": { "fillOpacity": 20, "lineWidth": 2 }
+        }
+      }
+    },
+    {
+      "title": "Средний чек",
+      "description": "Средняя сумма заказа за последние 30 дней.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT avg(total_amount) / 100 as avg_check FROM analytics.order_events WHERE event_type = 'order.placed' AND event_date >= today() - 30",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyRUB"
+        }
+      }
+    },
+    {
+      "title": "Всего заказов",
+      "description": "Общее количество оформленных заказов за 30 дней.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT count(DISTINCT event_id) as total_orders FROM analytics.order_events WHERE event_type = 'order.placed' AND event_date >= today() - 30",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "title": "% отмен",
+      "description": "Процент отменённых заказов от общего числа оформленных.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT round(countIf(event_type = 'order.cancelled') * 100.0 / countIf(event_type = 'order.placed'), 1) as cancel_rate FROM analytics.order_events WHERE event_date >= today() - 30",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 25 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Конверсия воронки",
+      "description": "Процент перехода между этапами: placed→paid, paid→shipped, shipped→delivered.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT round(countIf(event_type = 'order.paid') * 100.0 / countIf(event_type = 'order.placed'), 1) as paid_rate FROM analytics.order_events WHERE event_date >= today() - 30",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "title": "Топ-10 товаров по количеству продаж",
+      "description": "Самые продаваемые товары за последние 30 дней (по количеству единиц).",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT product_name, sum(quantity) as total_sold, sum(price_amount * quantity) / 100 as revenue_rub, count(DISTINCT order_id) as orders_count FROM analytics.order_item_events WHERE event_date >= today() - 30 GROUP BY product_name ORDER BY total_sold DESC LIMIT 10",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "title": "Заказы по дням (по типу события)",
+      "description": "Динамика событий заказов по дням с разбивкой по типу.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_date as time, event_type, count(DISTINCT event_id) as cnt FROM analytics.order_events WHERE event_date >= today() - 30 GROUP BY event_date, event_type ORDER BY event_date",
+          "format": 0
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["analytics", "clickhouse", "e-commerce"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30d", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "RTS E-Commerce Analytics",
+  "uid": "rts-ecom-analytics",
+  "version": 1
+}
