@@ -62,7 +62,7 @@ swag init -g cmd/app/main.go --parseDependency --parseInternal
 # Сборка образа
 docker build -t real-time-system:latest .
 
-# Запуск с docker-compose (app + PostgreSQL)
+# Запуск с docker-compose (app + PostgreSQL + Kafka + Observability stack)
 docker-compose up -d
 
 # Логи
@@ -99,7 +99,7 @@ kubectl port-forward svc/app-service 8080:80 -n real-time-system
 
 ## Environment Configuration
 
-The app requires PostgreSQL. Set variables via `.env` or environment:
+The app requires PostgreSQL, Kafka, ClickHouse. Set variables via `.env` or environment:
 
 **PostgreSQL:**
 - `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_NAME`, `POSTGRES_CONNECT_TIMEOUT`
@@ -111,6 +111,25 @@ The app requires PostgreSQL. Set variables via `.env` or environment:
 - `HTTP_IDLE_TIMEOUT` (default: 60s)
 - `HTTP_SHUTDOWN_TIMEOUT` (default: 30s)
 
+**Kafka:**
+- `KAFKA_BROKERS` (default: localhost:9094)
+- `KAFKA_TOPIC_ORDERS` (default: orders)
+
+**Observability:**
+- `JAEGER_ENDPOINT` (default: localhost:4317)
+- `SERVICE_NAME` (default: real-time-system)
+- `TRACING_ENABLED` (default: true)
+
+**ClickHouse (аналитика):**
+- `CLICKHOUSE_HOST` (default: localhost)
+- `CLICKHOUSE_PORT` (default: 9000, Native TCP)
+- `CLICKHOUSE_DATABASE` (default: analytics)
+- `CLICKHOUSE_USERNAME` (default: default)
+- `CLICKHOUSE_PASSWORD` (default: "")
+- `CLICKHOUSE_CONNECT_TIMEOUT` (default: 10s)
+- `CLICKHOUSE_BATCH_SIZE` (default: 100)
+- `CLICKHOUSE_FLUSH_INTERVAL` (default: 5s)
+
 ## Architecture
 
 This is a Go 1.25 project (`real_time_system` module) following Clean Architecture with DDD principles.
@@ -121,17 +140,24 @@ This is a Go 1.25 project (`real_time_system` module) following Clean Architectu
 - `domain/entity/` — Core business entities (User, Product, Order, Cart)
 - `domain/value_objects/` — Immutable value objects (Money)
 - `domain/repository/` — Repository interfaces
-- `internal/config/` — Environment-based config (PostgreSQL, HTTP)
+- `internal/config/` — Environment-based config (PostgreSQL, HTTP, Observability)
 - `internal/logger/` — Structured logging via Zap
 - `internal/server/` — Application lifecycle, dependency injection, graceful shutdown
 - `internal/controller/http/` — HTTP handlers, middleware, router (chi)
-- `internal/controller/http/middleware/` — Request ID, Logging middleware
+- `internal/controller/http/middleware/` — Request ID, Logging middleware (с trace_id корреляцией)
 - `internal/repository/postgres/` — PostgreSQL repository implementations
 - `internal/service/` — Business logic, orchestration
 - `internal/service/dto/` — Request/Response DTOs, mappers
+- `internal/worker/` — Concurrency patterns (Worker Pool, Fan-Out/Fan-In, Pipeline)
+- `internal/resilience/` — Resilience patterns (Semaphore)
+- `internal/observability/` — Prometheus metrics, OpenTelemetry tracing
+- `internal/events/` — Kafka event publishers/consumers
+- `internal/analytics/` — ClickHouse analytics (consumer + repository, batch insert)
 - `pkg/client/` — Reusable clients (PostgreSQL pool)
+- `pkg/kafka/` — Kafka producer/consumer wrappers
 - `docs/` — Auto-generated Swagger documentation
 - `k8s/` — Kubernetes manifests
+- `observability/` — Configs for Prometheus, Grafana, Jaeger, Loki, Promtail
 
 **Key patterns:**
 - Factory methods for entity creation with validation
@@ -142,14 +168,26 @@ This is a Go 1.25 project (`real_time_system` module) following Clean Architectu
 - SOFT DELETE with `deleted_at` + partial unique indexes
 - DTO pattern for API isolation + partial update (pointer-based)
 - Data Enrichment pattern (ProductName в CartItemResponse)
+- Snapshot Pattern (ProductName в OrderItem — данные на момент покупки)
 - Graceful shutdown with configurable timeout
+- Event-Driven Architecture (Kafka — order events)
+- Semaphore pattern (channel-based concurrent limiter)
 
 **HTTP Layer:**
 - chi router with middleware chain
 - Request ID (X-Request-ID) for tracing
-- Structured request/response logging
+- Structured request/response logging с trace_id/span_id корреляцией
 - Centralized error handling (DomainError → HTTP status)
 - Swagger UI at `/swagger/index.html`
+- OpenTelemetry HTTP middleware (otelhttp — автоматические span'ы)
+- Prometheus metrics middleware (RED method: Rate, Errors, Duration)
+
+**Observability Stack:**
+- Prometheus — метрики (RED method: `rts_http_requests_total`, `rts_http_request_duration_seconds`, `rts_http_requests_in_flight`)
+- Jaeger — distributed tracing через OpenTelemetry (OTLP gRPC)
+- Loki + Promtail — агрегация логов из Docker контейнеров
+- Grafana — единый UI для метрик, трейсов и логов (провижининг datasources + dashboards)
+- Корреляция: Logs → Traces (trace_id в логах → ссылка на Jaeger в Grafana)
 
 ## Architecture Guide
 
@@ -173,12 +211,21 @@ This is a Go 1.25 project (`real_time_system` module) following Clean Architectu
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check (K8s probes) |
+| GET | `/metrics` | Prometheus scrape endpoint |
 | GET | `/swagger/*` | Swagger UI |
 | POST | `/api/v1/users` | Create user |
 | GET | `/api/v1/users/{id}` | Get user by ID |
 | PATCH | `/api/v1/users/{id}` | Update user (partial) |
 | DELETE | `/api/v1/users/{id}` | Delete user (soft) |
 | POST | `/api/v1/cart/items` | Add item to cart |
+
+**Observability UI:**
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| Grafana | http://localhost:3000 | Dashboards (admin/admin) |
+| Jaeger | http://localhost:16686 | Distributed tracing |
+| Prometheus | http://localhost:9090 | Metrics & queries |
 
 ## Mentoring Plan — Путь к Senior
 
@@ -224,36 +271,57 @@ This is a Go 1.25 project (`real_time_system` module) following Clean Architectu
   - [x] Миграции применены (orders, order_items, product_name)
   - [x] Баги исправлены (nil map, currency mismatch, timestamps)
 
-- [ ] **Итерация 7 (в процессе)** — Concurrency Patterns (production-grade):
+- [x] **Итерация 7** — Concurrency & Resilience Patterns:
   - [x] Generic Worker Pool (`internal/worker/pool.go`)
   - [x] TrySubmit (context-aware submit)
   - [x] Тесты: BasicFlow, ContextCancel
   - [x] Fan-Out/Fan-In (`internal/worker/fanout.go`)
   - [x] Pipeline / Stage (`internal/worker/pipeline.go`)
-  - [ ] Semaphore
-  - [ ] Circuit Breaker
-  - [ ] Graceful Shutdown с горутинами
-- [ ] **Итерация 8** — WebSocket для real-time notifications
+  - [x] Semaphore (`internal/resilience/semaphore.go`) — Acquire, Release, TryAcquire
+
+- [x] **Итерация 7.5** — Observability Stack:
+  - [x] Prometheus метрики (RED method): requests_total, request_duration, requests_in_flight
+  - [x] Prometheus metrics middleware + `/metrics` endpoint
+  - [x] OpenTelemetry tracing → Jaeger (OTLP gRPC)
+  - [x] Трейсинг в PlaceOrder (span'ы для транзакции, DecrementStock)
+  - [x] Logging middleware: корреляция с trace_id/span_id
+  - [x] ObservabilityConfig (JAEGER_ENDPOINT, SERVICE_NAME, TRACING_ENABLED)
+  - [x] docker-compose: Prometheus, Jaeger, Loki, Promtail, Grafana
+  - [x] Grafana: провижининг datasources (Prometheus, Jaeger, Loki) + dashboard
+  - [x] Prometheus config (scrape app + self-monitoring)
+  - [x] Loki + Promtail для агрегации логов
+  - [x] Graceful shutdown TracerProvider (flush span'ов)
+
+- [x] **Итерация 8** — ClickHouse Analytics:
+  - [x] ClickHouseConfig (env-based, batch size + flush interval)
+  - [x] pkg/client/clickhouse.go (Native TCP, LZ4 compression, connection pool)
+  - [x] InitSchema (order_events, order_item_events — MergeTree, TTL, partitioning)
+  - [x] OrderEvent расширен: ItemsCount + Items (только для order.placed)
+  - [x] analytics/repository.go (batch insert: PrepareBatch → Append → Send)
+  - [x] analytics/consumer.go (Kafka → buffer → ClickHouse, time-or-size flush)
+  - [x] Интеграция в server.go (non-fatal init, graceful shutdown)
+  - [x] ClickHouse в docker-compose (clickhouse-server:24.8)
+  - [x] Grafana datasource + analytics dashboard (воронка, GMV, топ товаров)
+
+- [ ] **Итерация 9** — WebSocket для real-time notifications
 
 ### 🎯 Текущий статус
 
-**Дата:** 2026-02-08
+**Дата:** 2026-03-15
 
-**Что сделано в этой сессии:**
+**Что сделано:**
 
-1. **Fan-Out/Fan-In (`internal/worker/fanout.go`):**
-   - ✅ `FanOut[T, R]` — generic функция, одна горутина на задачу
-   - ✅ Горутины пишут в канал, основная функция читает (Fan-In)
-   - ✅ `sync.WaitGroup` + `close(results)` после завершения всех горутин
-   - ✅ Буфер канала = `len(tasks)` (отправка не блокируется)
-   - ✅ Тесты: AllTasksProcessed (сумма), ContextCancel (handler слушает ctx)
-
-2. **Pipeline / Stage (`internal/worker/pipeline.go`):**
-   - ✅ `Stage[T, R]` — generic функция, этап конвейера
-   - ✅ Канал без буфера (backpressure)
-   - ✅ Вложенный select при записи (защита от блокировки на unbuffered chan)
-   - ✅ Корректное закрытие `out` после завершения горутины
-   - ✅ Тесты: Chain (порядок гарантирован — поэлементная проверка), ContextCancel
+1. **ClickHouse Analytics (Итерация 8):**
+   - ✅ `internal/config/clickhouse.go` — ClickHouseConfig с batch параметрами
+   - ✅ `pkg/client/clickhouse.go` — клиент (Native TCP, LZ4, connection pool)
+   - ✅ `InitSchema` — создание таблиц при старте (MergeTree, partitioning, TTL 12 мес.)
+   - ✅ `domain/events/order_event.go` — расширен ItemsCount + Items[]
+   - ✅ `internal/events/order_publisher.go` — Items включаются для order.placed
+   - ✅ `internal/analytics/repository.go` — batch insert (PrepareBatch → Append → Send)
+   - ✅ `internal/analytics/consumer.go` — буферизированный consumer (time-or-size flush)
+   - ✅ `internal/server/server.go` — интеграция (non-fatal, graceful shutdown)
+   - ✅ `docker-compose.yaml` — ClickHouse сервис + Grafana ClickHouse плагин
+   - ✅ Grafana: ClickHouse datasource + analytics dashboard (воронка, GMV, топ товаров)
 
 **Файлы:**
 ```
@@ -264,44 +332,49 @@ internal/worker/
 ├── fanout_test.go    # ✅ Тесты
 ├── pipeline.go       # ✅ Pipeline / Stage
 └── pipeline_test.go  # ✅ Тесты
+
+internal/resilience/
+├── semaphore.go      # ✅ Channel-based semaphore
+└── semaphore_test.go # ✅ Тесты
+
+internal/observability/
+├── metrics.go        # ✅ Prometheus RED metrics + middleware
+└── tracing.go        # ✅ OpenTelemetry → Jaeger
+
+internal/analytics/
+├── consumer.go       # ✅ Kafka → ClickHouse (buffered, time-or-size flush)
+└── repository.go     # ✅ Batch insert (PrepareBatch + Append + Send)
+
+pkg/client/
+├── postgres.go       # ✅ PostgreSQL pool
+└── clickhouse.go     # ✅ ClickHouse (Native TCP, LZ4, InitSchema)
+
+observability/
+├── prometheus/prometheus.yml     # ✅ Scrape config
+├── grafana/datasources/          # ✅ Prometheus, Jaeger, Loki, ClickHouse
+├── grafana/dashboards/           # ✅ RTS Overview + Analytics dashboard
+├── loki/loki.yml                 # ✅ Log storage config
+└── promtail/promtail.yml         # ✅ Docker log collection
 ```
 
 ---
 
 ### 📅 План на следующую сессию
 
-**Цель:** Resilience Patterns — Semaphore и далее.
+**Цель:** Circuit Breaker, Retry, WebSocket.
 
 #### 🎯 Паттерны для реализации
 
 **1. ✅ Worker Pool — ГОТОВ**
 **2. ✅ Fan-Out/Fan-In — ГОТОВ**
 **3. ✅ Pipeline / Stage — ГОТОВ**
+**4. ✅ Semaphore — ГОТОВ**
+**5. ✅ Observability Stack — ГОТОВ**
+**6. ✅ ClickHouse Analytics — ГОТОВ**
 
-**4. Semaphore — ограничение concurrent запросов**
-
-**5. Circuit Breaker — устойчивость к сбоям**
-
-**6. Graceful Shutdown с горутинами**
-
-#### 📁 Структура файлов
-
-```
-internal/
-├── worker/
-│   ├── pool.go           # ✅ Generic Worker Pool
-│   ├── pool_test.go      # ✅ Тесты
-│   ├── fanout.go         # ✅ Fan-Out/Fan-In
-│   ├── fanout_test.go    # ✅ Тесты
-│   ├── pipeline.go       # ✅ Pipeline / Stage
-│   └── pipeline_test.go  # ✅ Тесты
-├── resilience/
-│   ├── semaphore.go      # Concurrent limiter
-│   ├── circuit_breaker.go
-│   └── retry.go          # Exponential backoff
-└── service/
-    └── order_service.go  # Интеграция с workers
-```
+**7. Circuit Breaker — устойчивость к сбоям**
+**8. Retry с Exponential Backoff**
+**9. WebSocket для real-time notifications**
 
 ---
 
@@ -408,6 +481,44 @@ internal/
   - bufferSize > количества задач для предсказуемости тестов
   - Handler должен слушать ctx для корректного теста отмены
 
+**ClickHouse (OLAP аналитика):**
+- **Columnar storage:** читает только нужные колонки → на порядки быстрее для агрегаций
+- **MergeTree engine:** append-only, автоматический merge фоновых parts
+- **"Too many parts" проблема:** каждый INSERT = новый part → max 1 INSERT/sec на таблицу
+  - Решение: batch insert (PrepareBatch → Append × N → Send = один part)
+- **LowCardinality(String):** словарная оптимизация для колонок с <10K уникальных значений
+- **PARTITION BY toYYYYMM:** физическое разделение данных для быстрого pruning и retention
+  - DROP PARTITION мгновенно удаляет месяц данных (vs DELETE = пометка строк)
+- **ORDER BY:** от менее кардинальных к более → лучше сжатие и гранулярный пропуск
+- **TTL:** автоудаление старых данных при merge (без cron)
+- **DateTime64(3, 'UTC'):** миллисекунды, UTC для консистентности
+- **Деньги как Int64 (копейки):** быстрее Decimal для агрегаций
+- **Native TCP (9000) vs HTTP (8123):** native для batch insert, HTTP для Grafana
+- **At-least-once дубликаты:** count(DISTINCT event_id) вместо count(*)
+- **Time-or-size buffering:** flush по размеру (BatchSize) или по таймеру (FlushInterval)
+- **Graceful shutdown:** finalFlush буфера → INSERT в ClickHouse → Commit Kafka → Close
+- **Non-fatal инициализация:** ClickHouse недоступен → приложение работает без аналитики
+
+**Resilience Patterns:**
+- **Semaphore:** channel-based, Acquire (context-aware), TryAcquire (non-blocking)
+  - `chan struct{}` с буфером = maxConcurrent
+  - select с ctx.Done() для отмены
+
+**Observability:**
+- **RED Method** (Rate, Errors, Duration) — минимальный набор метрик для сервиса
+- **Prometheus:** pull-based, promauto для регистрации, histogram vs summary
+  - Histogram для агрегации между инстансами (histogram_quantile)
+  - Кастомные buckets для web API latency
+  - High cardinality problem: нормализация URL в labels
+- **OpenTelemetry + Jaeger:** OTLP gRPC, BatchSpanProcessor, W3C TraceContext propagator
+  - Span'ы в критических путях (PlaceOrder → TX.DecrementStock)
+  - span.RecordError() + span.SetStatus() — оба нужны!
+  - Атрибуты span'а для поиска в Jaeger (user.id, order.id, items.count)
+- **Logs ↔ Traces корреляция:** trace_id в логах → ссылка на Jaeger в Grafana
+- **Grafana provisioning:** datasources + dashboards через файлы конфигурации
+- **Loki + Promtail:** индексация labels (не содержимого), Docker socket для сбора логов
+- **Порядок shutdown:** TracerProvider (flush span'ов) → Kafka → PostgreSQL
+
 **Docker:**
 - Multi-stage builds (builder + runtime)
 - Layer caching (go.mod → go mod download → COPY . .)
@@ -452,9 +563,22 @@ internal/
 - ✅ **Generic Worker Pool** с TrySubmit и тестами
 - ✅ **Fan-Out/Fan-In** — параллельная обработка задач
 - ✅ **Pipeline / Stage** — цепочка этапов с backpressure
+- ✅ **Semaphore** — channel-based concurrent limiter
+- ✅ **Observability Stack:**
+  - ✅ Prometheus метрики (RED method) + middleware
+  - ✅ OpenTelemetry tracing → Jaeger (OTLP gRPC)
+  - ✅ Loki + Promtail (агрегация логов)
+  - ✅ Grafana (unified UI, provisioned datasources + dashboards)
+  - ✅ Корреляция logs ↔ traces (trace_id)
+
+- ✅ **ClickHouse Analytics:**
+  - ✅ Kafka → ClickHouse pipeline (buffered consumer)
+  - ✅ order_events + order_item_events таблицы (MergeTree, TTL, partitioning)
+  - ✅ Batch insert (PrepareBatch → Append → Send)
+  - ✅ Grafana analytics dashboard (воронка, GMV, топ товаров, % отмен)
 
 **Следующие шаги:**
-- ⏳ Resilience Patterns (Semaphore, Circuit Breaker, Retry)
+- ⏳ Circuit Breaker + Retry (Exponential Backoff)
 - ⏳ WebSocket для real-time notifications
 - ⏳ Integration tests
 - ⏳ CI/CD pipeline
