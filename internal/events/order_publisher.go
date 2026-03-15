@@ -145,6 +145,24 @@ func (p *KafkaOrderPublisher) publish(ctx context.Context, order *entity.Order, 
 		Status:      string(order.Status),
 		TotalAmount: order.TotalAmount.Amount,
 		Currency:    string(order.TotalAmount.Currency),
+		ItemsCount:  len(order.Items),
+	}
+
+	// Items включаем ТОЛЬКО для order.placed — момент фиксации товаров.
+	// Для остальных событий (paid, shipped, ...) Items = nil → omitempty → не попадёт в JSON.
+	// Это экономит bandwidth Kafka: событие "paid" весит ~200 байт вместо ~2KB с Items.
+	if eventType == events.OrderPlaced && len(order.Items) > 0 {
+		eventItems := make([]events.OrderEventItem, 0, len(order.Items))
+		for _, item := range order.Items {
+			eventItems = append(eventItems, events.OrderEventItem{
+				ProductID:   item.ProductID.String(),
+				ProductName: item.ProductName,
+				Quantity:    item.Quantity,
+				PriceAmount: item.Price.Amount,
+				Currency:    string(item.Price.Currency),
+			})
+		}
+		event.Items = eventItems
 	}
 
 	// Сериализуем событие в JSON.

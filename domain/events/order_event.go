@@ -141,4 +141,48 @@ type OrderEvent struct {
 
 	// Currency — код валюты по ISO 4217 (RUB, USD, EUR).
 	Currency string `json:"currency"`
+
+	// ItemsCount — количество уникальных товаров в заказе.
+	// Используется для аналитики: корреляция размера заказа с конверсией.
+	// Не len(Items), потому что Items заполняется только для order.placed.
+	ItemsCount int `json:"items_count"`
+
+	// Items — позиции заказа (заполняется ТОЛЬКО для order.placed).
+	//
+	// ┌──────────────────────────────────────────────────────────────────────┐
+	// │ ПОЧЕМУ ITEMS ТОЛЬКО ДЛЯ order.placed?                                 │
+	// └──────────────────────────────────────────────────────────────────────┘
+	//
+	// order.placed — момент, когда корзина превращается в заказ.
+	// Именно здесь фиксируется снимок товаров (Snapshot Pattern).
+	// Последующие события (paid, shipped, delivered, cancelled) меняют
+	// только СТАТУС заказа, не его содержимое.
+	//
+	// Включать Items в каждое событие:
+	//   ❌ Лишний payload (× 5 типов событий × N товаров)
+	//   ❌ Дублирование данных в Kafka
+	//   ❌ Увеличение consumer lag при высоком трафике
+	//
+	// Items только в placed:
+	//   ✅ Один раз записали в ClickHouse order_item_events
+	//   ✅ Остальные события — лёгкие (только статус + метаданные)
+	//
+	// omitempty: если Items == nil → поле не попадёт в JSON.
+	// Это сохраняет обратную совместимость: старые консьюмеры,
+	// которые не знают про Items, не сломаются.
+	Items []OrderEventItem `json:"items,omitempty"`
+}
+
+// OrderEventItem — товарная позиция внутри события заказа.
+//
+// Отдельная структура, НЕ entity.OrderItem, потому что:
+// - domain/events не должен зависеть от domain/entity (циклические зависимости)
+// - Формат события = контракт API, entity = внутренняя модель
+// - Поля конвертированы в примитивы (string вместо ProductID, int64 вместо Money)
+type OrderEventItem struct {
+	ProductID   string `json:"product_id"`
+	ProductName string `json:"product_name"`
+	Quantity    int    `json:"quantity"`
+	PriceAmount int64  `json:"price_amount"` // копейки
+	Currency    string `json:"currency"`
 }
